@@ -27,3 +27,17 @@
 
 )
 
+for my $cf (@CustomFields) {
+    push @ACL, (
+        { GroupId => 'DutyTeam',
+          GroupDomain => 'UserDefined',
+          CF => $cf->{Name},
+          Queue => $cf->{Queue},
+          Right => 'SeeCustomField', },
+        { GroupId => 'DutyTeam',
+          GroupDomain => 'UserDefined',
+          CF => $cf->{Name},
+          Queue => $cf->{Queue},
+          Right => 'ModifyCustomField', },
+    );
+}

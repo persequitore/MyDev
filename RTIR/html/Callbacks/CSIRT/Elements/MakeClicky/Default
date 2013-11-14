@@ -71,7 +71,7 @@ my %actions;
 
         my $host = $args{'all_matches'}[3];
         my $escaped_host = $escaper->($host);
-	my $escaped_url = $escaper->($args{value});
+	    my $escaped_url = $escaper->($args{value});
         my $super = $super{url} ? $super{url}->(%args) : $escaper->($args{value});
 
         my $result = qq{[<a href="$web_path/RTIR/Tools/Lookup.html?$args{lookup_params}type=host&q=$escaped_host">}
@@ -92,12 +92,12 @@ my %actions;
 
         my $host = $args{'all_matches'}[3];
         my $escaped_host = $escaper->($host);
-	my $escaped_url = $escaper->($args{value});
+	    my $escaped_url = $escaper->($args{value});
         my $super = $super{url_overwrite} ? $super{url_overwrite}->(%args) : $escaper->($args{value});
 
         my $result = qq{[<a href="$web_path/RTIR/Tools/Lookup.html?$args{lookup_params}type=host&q=$escaped_host">}
             .loc('lookup "[_1]"', $host) .qq{</a>]};
-	$result .= qq{[<a href="$web_path/RTIR/Tools/Lookup.html?$args{lookup_params}type=url&q=$escaped_url">}
+	    $result .= qq{[<a href="$web_path/RTIR/Tools/Lookup.html?$args{lookup_params}type=url&q=$escaped_url">}
             .loc('lookup URL') .qq{</a>]};
         if ( $args{'ticket'} && $args{'ticket'}->id ) {
 		my $cf = RT::IR::GetCustomField('URL');
@@ -160,6 +160,13 @@ my %actions;
         my $escaped_domain = $escaper->($domain);
         $result .= qq{ [<a href="$web_path/RTIR/Tools/Lookup.html?$args{'lookup_params'}type=host&q=$escaped_domain">}
                .loc('lookup "[_1]"', $domain) .qq{</a>]};
+        if ( $args{'ticket'} && $args{'ticket'}->id ) {
+            my $cf = RT::IR::GetCustomField('Evidence');
+            my $tid = $args{'ticket'}->id;
+            $result .= qq{[<a href="$web_path/RTIR/Edit.html?id=$tid}
+                .qq{&Object-RT::Ticket-$tid-CustomField-}. $cf->id .qq{-AddValue=$escaped_email}
+                .q{&SaveChanges=1">}. loc('Add Email') .q{</a>]};
+        }
         return $escaper->($args{'value'}) . qq{ <span class="clickylink">$result</span>};
     },
     noc => sub {
@@ -174,6 +181,13 @@ my %actions;
         $args{value} = $escaper->($args{value});
         my $result = qq{[<a href="$web_path/RTIR/Tools/Lookup.html?$args{lookup_params}type=host&q=$args{value}">}
                .loc('lookup host') .qq{</a>]};
+        if ( $args{'ticket'} && $args{'ticket'}->id ) {
+            my $cf = RT::IR::GetCustomField('Domain');
+            my $tid = $args{'ticket'}->id;
+            $result .= qq{[<a href="$web_path/RTIR/Edit.html?id=$tid}
+                .qq{&Object-RT::Ticket-$tid-CustomField-}. $cf->id .qq{-AddValue=$args{value}}
+                .q{&SaveChanges=1">}. loc('Add Host/Domain') .q{</a>]};
+        }               
         return $args{value} . qq{ <span class="clickylink">$result</span>};
     },
 );
