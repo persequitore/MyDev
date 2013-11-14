@@ -1,0 +1,29 @@
+@CustomFields = (
+	{
+		Name 		=> 	'URL',
+		Type		=> 	'FreeformMultiple',
+		Queue		=>	['Incidents', 'Investigations', 'Incident Reports'],
+		Disabled	=> 	0,
+		Pattern		=> 	'^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?',
+		Description	=>	'URLs for RTIR Queues',
+		LinkValueTo => '__WebPath__/RTIR/Tools/Lookup.html?type=url&q=__CustomField__&ticket=__id__'
+	},
+	{
+		Name		=> 	'Domain',
+		Type		=>	'FreeformMultiple',
+		Queue 		=>	['Incidents', 'Investigations', 'Incident Reports'],
+		Disabled	=>	0,
+		Description	=>	'Domains for RTIR Queues',
+		LinkValueTo => '__WebPath__/RTIR/Tools/Lookup.html?type=domain&q=__CustomField__&ticket=__id__'
+	},
+	{
+		Name		=>  'Evidence',
+		Type 		=>	'FreeformMultiple',
+		Queue 		=>  ['Incidents', 'Investigations', 'Incident Reports'],
+		Disabled	=> 	0,
+		Description	=>	'Evidences not supported by current RTIR meta information',
+		LinkValueTo =>	'__WebPath__/RTIR/Tools/Lookup.html?type=evidence&q=__CustomField__&ticket=__id__'
+	}
+
+)
+
