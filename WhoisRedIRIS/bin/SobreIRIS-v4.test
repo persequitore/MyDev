@@ -1,0 +1,803 @@
+#! /usr/bin/perl
+
+package SobreIRIS;
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use POE qw(Component::Server::TCP Filter::Reference Component::Client::Whois::Smart);
+use Net::LDAP;
+use NetAddr::IP;
+use Net::IP;
+use Net::Whois::RIPE;
+use Data::Validate::Email;
+use Data::Validate::IP;
+use Data::Validate::Domain;
+use Net::DNS;
+
+# SQL libraries
+use CGI::Carp qw(fatalsToBrowser);
+use DBI;
+
+    
+our $VERSION = 4.00;
+our $DEBUG = 0;
+
+
+# Reading parameters
+my $conffile="/etc/sobreiris/SobreIRIS_Conf-test.pm";
+
+LoadConfig($conffile);
+
+# starts Net::Whois::Gateway::Server
+    
+#$POE::Component::Client::Whois::Smart::DEBUG = $DEBUG;
+my $port;   
+if ($SobreIRIS::ListenOnPort) {
+	$port = $SobreIRIS::ListenOnPort;
+} else {
+	$port = 43;
+}
+
+MySQLConnect();
+
+POE::Component::Server::TCP->new(
+	Alias => "sobreiris",
+	Port         => $port,
+	ClientConnected => \&ClientConnected,
+	#ClientFilter => "POE::Filter::Reference",
+    	ClientInput  => \&got_request,
+    	InlineStates => {
+    		return_result => \&return_result,
+  	},
+    	ClientDisconnected => \&ClientDisconnected,
+);
+
+print "Server started in DEBUG mode\n" if $DEBUG;
+$poe_kernel->run();
+    
+exit (0);
+
+
+###########################################################################################
+##################################  F U N C T I O N S  ####################################
+###########################################################################################
+# Functions for reading configuration file
+# Load the configuration file
+sub LoadConfig {
+   my $CONFIG_FILE = shift;
+   local *Set = sub { $_[0] = $_[1] unless defined $_[0] };
+   require $CONFIG_FILE || die ("Couldn't load SobreIRIS config file '$CONFIG_FILE'\n$@");
+}    
+
+###########################################################################################
+# Functions on charge of the connections, they are logging all the connections.
+###########################################################################################
+sub ClientConnected {
+	if (open LOGFILE,">>$SobreIRIS::LogFile") {
+		print LOGFILE scalar localtime(time)." Connection established from $_[HEAP]{remote_ip}\n";
+		print LOGFILE "\t > Concurrent connections: $_[HEAP]{connections}\n" if defined $_[HEAP]{connections};
+		close LOGFILE;
+		$_[HEAP]{client}->put("SobreIRIS $VERSION: Servidor de whois de RedIRIS\n");
+	}
+}
+
+###########################################################################################
+sub ClientDisconnected {
+	if (open LOGFILE,">>$SobreIRIS::LogFile") {
+		print LOGFILE scalar localtime(time)." Client from $_[HEAP]{remote_ip} has been disconnected\n";
+		close LOGFILE;
+	}
+}	
+###########################################################################################
+# Functions on charge to response all the request donde to the whois server
+###########################################################################################
+# got client input, starting session for new job:
+sub got_request {
+    my ($kernel, $heap, $session, $input) = @_[KERNEL, HEAP, SESSION, ARG0];
+
+	my @queries;
+	&printerror("String entered: '$input'");
+	push @queries, $input;
+	my %output; 	
+	
+	my $datain = $input;
+	$datain =~ s/\n|\t|\s//g;
+	if ($datain ne "" && defined $input) {
+ 		if ( &isIp($input) ) {
+ 			if ( &queryLdapbyIp( $input, \%output ) ) {
+	 			&return_ldapresult($kernel,$heap, \%output);
+ 			} else {
+ 				POE::Component::Client::Whois::Smart->whois(    
+        			query => \@queries,
+	        		event => 'return_result',
+				referral => 2,
+	    		);
+ 			}
+    		return;
+	 	}
+ 		
+	 	if ( &isHostname ($input) ) {   
+ 			my $ip = &getIp($input);
+ 			if (defined $ip) {
+ 				if ( &queryLdapbyIp ( $ip, \%output ) ) {
+	 				&return_ldapresult($kernel,$heap,\%output);
+ 					return;
+ 				}
+	 		}
+ 		}
+ 	
+	 	if ( &isDomain($input) ) {
+ 			if ( &queryLdapbydomain( $input, \%output ) ) {
+	 			&return_ldapresult ($kernel,$heap, \%output);
+ 				return;
+	 		}
+ 		}
+ 	  
+		&return_noresults($kernel,$heap);
+	} else { 
+		&printerror("Invalid or empty input string");
+		$kernel->yield("shutdown");
+	}
+};
+
+###########################################################################################
+# return result to client
+sub return_result {
+    my ($kernel, $heap, $answer) = @_[KERNEL, HEAP, ARG0];
+    foreach my $result ( @{$answer} ) {
+    	my $query = $result->{query} if $result;
+    	if ($result->{error}) {
+    		$answer =  "Can't resolve WHOIS-info for ".$result->{query}."\n";
+    	} else {
+    		$answer =  "Query: ".$result->{query}."\n";
+    		$answer .= "Server: ".$result->{server}."\n";
+    		$answer .= "Whois answer: \n".$result->{whois}."\n\n";
+        }
+    }                  
+
+    $heap->{client}->put($answer) if defined $heap->{client};
+    $kernel->yield("shutdown");
+}
+
+###########################################################################################
+sub return_ldapresult {
+	my ($kernel,$heap,$entries_all) = @_;
+	my $resultados ="";
+	
+	if (defined $entries_all->{ip}) {
+		foreach (@{$entries_all->{ip}}) {
+			$resultados .= &e2sIPRange($_);
+		}
+		
+	} else {
+		$resultados = "No hay entradas para ese rango/Not netblock found\n";
+	}
+	
+	if (defined $entries_all->{institution} ) {
+		foreach (@{$entries_all->{institution}}) {
+			$resultados .= &e2sInstitucion($_);
+		}
+	} else {
+			$resultados .= "No hay entradas de institucion para la busqueda realizada/Not institucion entries found for this search\n";
+	}
+	
+	$resultados .= "%----------------------------------------------------------------------\n";
+	$resultados .= "% Contactos Oficiales\n";
+	if (defined $entries_all->{irisPersons} ) {
+		foreach (@{$entries_all->{irisPersons}}) {
+			$resultados .= &e2sPerson($_);
+		}
+	} else {
+			$resultados .= "No hay entradas de contactos CERT/ Not contact person found for this search\n";
+	}
+	
+	$resultados .= "%----------------------------------------------------------------------\n";
+	$resultados .= "% Contactos CERT\n";
+	if (defined $entries_all->{certPersons} ) {
+		foreach (@{$entries_all->{certPersons}}) {
+			$resultados .= &e2sPerson($_);
+		}
+	} else {
+		$resultados .= "No hay entradas de contactos CERT/ Not contact person found for this search\n";
+	}
+
+    $heap->{client}->put($resultados) if defined $heap->{client};
+ 	$kernel->yield("shutdown");
+}
+
+###########################################################################################
+sub return_noresults {
+	my ($kernel,$heap) = @_;
+	
+    $heap->{client}->put("No hay resultados") if defined $heap->{client};
+ 	$kernel->yield("shutdown");
+}
+	
+
+###########################################################################################
+sub stop {
+    $poe_kernel->stop();
+}
+
+
+###########################################################################################
+# LDAP functions
+###########################################################################################
+sub connectLDAP {
+   my $server = shift;
+   my $port = shift;
+   
+   my $ldap = Net::LDAP->new( $server,
+                              port => $port,
+                              timeour => 10,
+                              async => 1
+                              );
+   return $ldap;
+
+}
+
+###########################################################################################
+# Disconnect from LDAP
+sub disconnectLDAP {
+   my $ldap = shift;
+   
+   $ldap->unbind();
+}
+
+###########################################################################################
+# Bind LDAP
+sub bindLDAP {
+   my $ldap = shift;
+   my $binddn = shift;
+   my $password = shift;
+   $ldap->bind($binddn, password => $password);
+}
+###########################################################################################
+# Check functions
+###########################################################################################
+# Check is an IP
+sub isIp {
+	my ($querystring) = @_;
+	my $ip = Data::Validate::IP->new();
+	if ( $ip->is_ipv4($querystring) ) {
+		return 1;
+	}
+	return 0;
+}
+
+###########################################################################################
+# Check is a hostname
+sub isHostname {
+	my ($querystring) = @_;
+	my $res = Net::DNS::Resolver->new;
+	my $query = $res->search($querystring);
+	if ($query) {
+		foreach my $rr ($query->answer) {
+			if ($rr->type eq "A") {
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+
+
+###########################################################################################
+# Get hostname from IP
+sub getHostanme {
+	my ($querystring) = @_;
+	
+	my $ip = Data::Validate::IP->new();
+	if ($ip->is_ipv4($querystring)) {
+		my $res = Net::DNS::Resolver->new;
+		my $query = $res->search($querystring);
+		if ($query) {
+			foreach my $rr ($query->answer) {
+				if ( $rr->type eq "PTR" ) {
+					return $rr->ptrdname;
+				}
+			}
+		}
+	}
+	return undef;
+}
+
+###########################################################################################
+# Get IP from hostname
+sub getIp {
+	my ($querystring) = @_;
+	my $res = Net::DNS::Resolver->new;
+	my $query = $res->search($querystring);
+	if ($query) {
+		foreach my $rr ($query->answer) {
+			if ($rr->type eq "A") {
+				return $rr->address;
+			}
+		}
+	}
+	return undef;	
+}
+
+###########################################################################################
+# Check if it's a domain
+sub isDomain {
+   my ($querystring) = @_;
+   
+   my $v = Data::Validate::Domain->new();
+   if ($v->is_domain($querystring)) {
+      my $res = Net::DNS::Resolver->new;
+      my $query = $res->query($querystring, "SOA");
+      if ($query) {
+         return 1;
+      }
+   }
+   return 0;
+}  
+ 
+###########################################################################################
+# Check if it's a mail address
+sub isMailAddress {
+   my ($querystring) = @_;
+   
+   my $v = Data::Validate::Email->new();
+   if ($v->is_email($querystring)) {
+      return 1;
+   }
+   return 0;
+}  
+
+###########################################################################################
+sub moreSpecific {
+   my $entries = shift;
+   my $rightEntry = shift;
+   my $range = undef;
+   my $cidr = shift;
+   foreach my $entry (@$entries) {
+      my $tempEntry = $entry;
+      my $diff = $entry->get_value('irisWhoisLastIp') - $entry->get_value('irisWhoisFirstIp');
+      if (defined $range) {
+         if ($diff < $range) {
+            $$rightEntry = $entry;
+            $range = $diff;
+            $$cidr = $entry->get_value('irisWhoisCIDR');
+         }
+      } else {
+         $$rightEntry = $entry;
+         $range = $diff;
+         $$cidr = $entry->get_value('irisWhoisCIDR');
+      }
+   }
+}  
+
+###########################################################################################
+
+# Perfom a search in LDAP
+sub searchLDAP {
+	my $ldap = shift;
+	my $filter = shift;
+	my $base = shift;
+	my $scope = shift;
+	
+	my $mesg = $ldap->search ( # perform a new search
+		base => $base,
+      	filter => $filter,
+      	scope => $scope
+      	);
+   	if ($mesg->error eq "Success") {
+      	if (scalar ($mesg->all_entries) > 0) {
+         	my @aux = $mesg->all_entries;
+         	return \@aux;
+      	} else {
+      		&printerror ("No entries found") if $SobreIRIS::VERBOSE;
+        	return undef;
+      	}
+   	} else {
+   		&printerror ("No valid serach. Code: ".$mesg->code." Info: ".$mesg->error) if $SobreIRIS::VERBOSE;
+   		return undef;
+   	}
+   	return undef;
+}
+
+
+###########################################################################################
+sub queryLdapbyIp {
+	my $querystring = shift;
+	my $queryoutput = shift;
+	my @ldapconf = @{$SobreIRIS::LDAPInfo};
+	my $confldap = ();
+
+	for (my $i = 0; $i < scalar(@ldapconf); $i= $i+2) {
+        my @ldapspecif = @{$ldapconf[$i+1]};
+        for (my $j = 0; $j < scalar(@ldapspecif); $j = $j+2) {
+                $confldap->{$ldapconf[$i]}->{$ldapspecif[$j]} = $ldapspecif[$j+1];
+        }
+	}
+	
+	my $ldapip = connectLDAP($confldap->{'ip'}->{'Host'},$confldap->{'ip'}->{'Port'});
+ 	if (defined $ldapip) {
+ 		$ldapip->bind($confldap->{'ip'}->{'BindDN'},password => $confldap->{'ip'}->{'BindPassword'});
+ 		my $filter = $confldap->{'ip'}->{'Filter'};
+ 		my $ip = new NetAddr::IP($querystring);
+        my $numip = $ip->numeric();
+        $filter =~ s/VALUE_DATA/$numip/g;
+        my $scope = "sub";
+        my $entries = searchLDAP($ldapip,$filter,$confldap->{'ip'}->{'BaseDN'},$scope);
+       
+	if (open LOGFILE,">>$SobreIRIS::LogFile") {
+	print LOGFILE "\n\t1: ", $ldapip;
+	print LOGFILE "\n\t2: ", $filter;
+	print LOGFILE "\n\t3: ", $scope;
+	close LOGFILE;
+	}
+
+
+	if (defined $entries) {
+        	my $entry;
+            my $cidr;          
+            &moreSpecific($entries,\$entry,\$cidr);
+            my @entriesout;
+            push @entriesout, $entry;
+            $queryoutput->{ip}= \@entriesout;
+
+            my $netname = $entry->get_value('irisWhoisNetName');
+            $entry->get_value('irisClassifCode') =~ /urn:mace:rediris.es:classif:organization:(.*)/;
+            my $code = $1;
+            disconnectLDAP($ldapip);
+               
+           # Buscamos ahora a la institucion a la que pertenece el rango de la IP            
+            my $ldapinst = connectLDAP ($confldap->{'institution'}->{'Host'},$confldap->{'institution'}->{'Port'});
+            if (defined $ldapinst) {
+            	$ldapinst->bind($confldap->{'institution'}->{'BindDN'}, password => $confldap->{'institution'}->{'BindPassword'});
+            	my $filterinst = $confldap->{'institution'}->{'Filter'};
+            	$filterinst =~s/VALUE_DATA/$code/g;
+            	my $scopeinst = "sub";
+               	my $entriesinst = searchLDAP($ldapinst,$filterinst,$confldap->{'institution'}->{'BaseDN'},$scopeinst);	
+               	$queryoutput->{institution} = $entriesinst;
+               	disconnectLDAP($ldapinst);
+            }  
+           	
+           	# Buscamos ahora los contactos oficiales de la institucion
+           	my $ldapiriscontact = connectLDAP ($confldap->{'irisPerson'}->{'Host'},$confldap->{'irisPerson'}->{'Port'});
+            if (defined $ldapiriscontact) {
+            	$ldapiriscontact->bind($confldap->{'irisPerson'}->{'BindDN'}, password => $confldap->{'irisPerson'}->{'BindPassword'});
+            	my $filtercontact = $confldap->{'irisPerson'}->{'Filter'};
+            	$filtercontact =~s/VALUE_DATA/$code/g;
+            	my $scopecontact = "sub";
+               	my $entriescontact = searchLDAP($ldapiriscontact,$filtercontact,$confldap->{'irisPerson'}->{'BaseDN'},$scopecontact);	
+               	$queryoutput->{irisPersons} = $entriescontact;
+               	disconnectLDAP($ldapiriscontact);
+            }  
+           	
+           	# Buscamos ahora los contactos del CERT en nuestra rama 
+           	my $ldapcertcontact = connectLDAP ($confldap->{'certPerson'}->{'Host'},$confldap->{'certPerson'}->{'Port'});
+            if (defined $ldapcertcontact) {
+            	$ldapcertcontact->bind($confldap->{'certPerson'}->{'BindDN'}, password => $confldap->{'certPerson'}->{'BindPassword'});
+            	my $filtercontact = $confldap->{'certPerson'}->{'Filter'};          
+            	$filtercontact =~s/VALUE_DATA/$netname/g;
+		&printerror($filtercontact);
+            	my $scopecontact = "sub";
+               	my $entriescontact = searchLDAP($ldapcertcontact,$filtercontact,$confldap->{'certPerson'}->{'BaseDN'},$scopecontact);	
+               	$queryoutput->{certPersons} = $entriescontact;
+               	disconnectLDAP($ldapcertcontact);
+            }  
+
+            return 1;
+        }  		
+ 	} else {
+ 		&printerror ("No se ha podido conectar al servidor ldap: ".$confldap->{'ip'}->{'Host'}.":".$confldap->{'ip'}->{'Port'});
+ 	}
+	
+	return 0;
+}
+
+
+###########################################################################################
+sub queryLdapbydomain {
+	my $querystring = shift;
+	my $queryoutput = shift;
+
+	my @ldapconf = @{$SobreIRIS::LDAPInfo};
+	my $confldap = ();
+
+	for (my $i = 0; $i < scalar(@ldapconf); $i= $i+2) {
+        my @ldapspecif = @{$ldapconf[$i+1]};
+        for (my $j = 0; $j < scalar(@ldapspecif); $j = $j+2) {
+                $confldap->{$ldapconf[$i]}->{$ldapspecif[$j]} = $ldapspecif[$j+1];
+        }
+	}
+	
+	my $ldapdomain = connectLDAP($confldap->{'domain'}->{'Host'},$confldap->{'domain'}->{'Port'});
+ 	if (defined $ldapdomain) {
+ 		$ldapdomain->bind($confldap->{'domain'}->{'BindDN'},password => $confldap->{'domain'}->{'BindPassword'});
+ 		my $filter = $confldap->{'domain'}->{'Filter'};
+        $filter =~ s/VALUE_DATA/$querystring/g;
+        my $scope = "sub";
+        print $filter,"\n";
+        my $entries = searchLDAP($ldapdomain,$filter,$confldap->{'domain'}->{'BaseDN'},$scope);
+        if (defined $entries) {
+        	my $ entry;
+        	my $code;
+        	my $netname;
+        	my @entriesout;
+        	my @dataqueries;
+        	foreach my $entry (@$entries) {
+        		if (not $entry->exists('schacExpiryDate') ) {
+        			print $entry->dn,"\n";
+        			push @entriesout,$entry;
+        			my %dataquery;
+        			my $values = $entry->get_value('schacPersonalUniqueID', asref => 1);
+        			foreach my $value (@$values) {
+        				if ($value =~ /copa/) {
+        					$value =~ /urn:mace:terena.org:schac:personalUniqueID:es:copa:(.*)/;
+        					$dataquery{code} = $1;
+        					print $dataquery{code},"\n";
+        				}
+        			}
+        			my $value = $entry->get_value('schacPersonalUniqueCode');
+        			$value =~ /urn:mace:terena.org:schac:personalUniqueCode:es:(.*)/;
+        			$dataquery{netname} = $1;
+        			print $dataquery{netname},"\n";
+        			push @dataqueries,\%dataquery;
+        			
+        		}
+        	}
+        	$queryoutput->{institution} = \@entriesout;    	
+            disconnectLDAP($ldapdomain);
+               
+           	# Buscamos ahora los rangos IPs de la institucion            
+            my $ldapip = connectLDAP ($confldap->{'ipdomain'}->{'Host'},$confldap->{'ipdomain'}->{'Port'});
+            if (defined $ldapip) {
+	           	my @entriesoutip;
+               	$ldapip->bind($confldap->{'ipdomain'}->{'BindDN'}, password => $confldap->{'ipdomain'}->{'BindPassword'});
+            	my $filterip = $confldap->{'ipdomain'}->{'Filter'};
+            	foreach my $dataquery (@dataqueries) {
+            		print $dataquery->{code},"\n";
+            		my $filteripaux = $filterip;
+	            	$filteripaux =~ s/VALUE_DATA/$dataquery->{code}/g;
+	            	print $filteripaux,"\n";
+    	        	my $scopeip = "sub";
+        	       	my $entriesip = searchLDAP($ldapip,$filteripaux,$confldap->{'ipdomain'}->{'BaseDN'},$scopeip);	
+        	       	foreach (@$entriesip) {
+        	       		print $_->dn,"\n";
+        	       		push @entriesoutip, $_;
+        	       	} 
+            	
+            	}
+            	$queryoutput->{ip} = \@entriesoutip;
+               	disconnectLDAP($ldapip);
+            }  
+           	
+           	# Buscamos ahora los rangos IPs de la institucion            
+            my $ldapiriscontact = connectLDAP ($confldap->{'irisPerson'}->{'Host'},$confldap->{'irisPerson'}->{'Port'});
+            if (defined $ldapiriscontact) {
+	           	my @entriesoutiriscontact;
+               	$ldapiriscontact->bind($confldap->{'irisPerson'}->{'BindDN'}, password => $confldap->{'irisPerson'}->{'BindPassword'});
+            	my $filteririscontact = $confldap->{'irisPerson'}->{'Filter'};
+            	foreach my $dataquery (@dataqueries) {
+            		my $filteririscontactaux = $filteririscontact;
+	            	$filteririscontactaux =~ s/VALUE_DATA/$dataquery->{code}/g;
+    	        	my $scopeiriscontact = "sub";
+        	       	my $entriesiriscontact = searchLDAP($ldapiriscontact,$filteririscontactaux,$confldap->{'irisPerson'}->{'BaseDN'},$scopeiriscontact);	
+        	       	foreach (@$entriesiriscontact) {
+        	       		push @entriesoutiriscontact, $_;
+        	       	}
+            	
+            	}
+            	$queryoutput->{irisPersons} = \@entriesoutiriscontact;
+               	disconnectLDAP($ldapiriscontact);
+            }  
+           	
+           	# Buscamos ahora los contactos del CERT en nuestra rama 
+            my $ldapcertcontact = connectLDAP ($confldap->{'certPerson'}->{'Host'},$confldap->{'certPerson'}->{'Port'});
+            if (defined $ldapcertcontact) {
+	           	my @entriesoutcertcontact;
+               	$ldapcertcontact->bind($confldap->{'certPerson'}->{'BindDN'}, password => $confldap->{'certPerson'}->{'BindPassword'});
+            	my $filtercertcontact = $confldap->{'certPerson'}->{'Filter'};
+            	foreach my $dataquery (@dataqueries) {
+            		my $filtercertcontactaux = $filtercertcontact;
+	            	$filtercertcontactaux =~ s/VALUE_DATA/$dataquery->{netname}/g;
+    	        	my $scopecertcontact = "sub";
+        	       	my $entriescertcontact = searchLDAP($ldapcertcontact,$filtercertcontactaux,$confldap->{'certPerson'}->{'BaseDN'},$scopecertcontact);	
+        	       	foreach (@$entriescertcontact) {
+        	       		push @entriesoutcertcontact, $_;
+        	       	}        	       	        	       	
+            	
+            	}
+            	$queryoutput->{certPersons} = \@entriesoutcertcontact;
+               	disconnectLDAP($ldapcertcontact);
+            }  
+
+            return 1;
+        }  		
+ 	} else {
+ 		&printerror ("No se ha podido conectar al servidor ldap: ".$confldap->{'ip'}->{'Host'}.":".$confldap->{'ip'}->{'Port'});
+ 	}
+	
+	return 0;
+
+	
+
+}
+
+###########################################################################################
+sub printerror {
+	my $string = shift;
+	if (open LOGFILE,">>$SobreIRIS::LogFile") {
+		print LOGFILE scalar localtime(time)." $string\n";
+		close LOGFILE;
+	}
+}
+
+###########################################################################################
+# Get an entry which is process at a string.
+sub e2sPerson {
+	my $entry = shift;
+   	my %atributos = (
+                    "cn"                            => "Nombre y Apellidos",
+                    "description"		    => "Cargo/Ocupación",
+                    "businessCategory"              => "Tipo de Contacto",
+                    "title"                         => "Titulo",
+                    "mail"                          => "Mail address",
+                    "telephoneNumber"               => "Telefono",
+                    "facsimileTelephoneNumber"      => "FAX",
+                    "schacUserStatus"		    => "Role",
+                    );
+   	my $string = "% Information related to ";
+	my %roles = ( 	'pec' => 'RT-CERT',
+			'resmanager' => 'Responsable de Investigación',
+			'techcontact' => 'Contacto Técnico',
+			'pen' => 'Contacto NOC',
+			'per' => 'Punto de Enlance con RedIRIS',
+			'sign' => 'Firmante de la Institución',
+		);
+   	$string .= $entry->dn() . "\n\n";
+   	foreach my $attr (keys %atributos) {
+   		if ($entry->exists($attr)) {
+   			if ($attr eq "schacUserStatus") {
+   				my $values = $entry->get_value($attr, asref => 1);
+   				foreach my $value ( @{$values} ) {
+   					if ($value =~ /:affiliation:role:/) {
+   						$value =~ /urn:mace:terena.org:schac:userStatus:es:rediris.es:affiliation:role:(.*)/;
+   						my $role = $1;
+						if (exists $roles{$role} ) {
+							$role = $roles{$role};
+						}
+   						$string .= $atributos{$attr}.":\t";
+   						if ($role) {
+	   						$string .= $role."\n";
+   						}
+   					}
+   				}
+   				
+   			} else {
+         			$string .= $atributos{$attr}.":\t";
+         			$string .= join " - ",@{$entry->get_value($attr, asref => 1)};  
+				$string .= "\n";       	
+   			}
+      	}
+   	}
+   	$string .= "\n";
+   	return $string;
+}  
+   
+###########################################################################################
+# Get an entry which is process at a string.
+sub e2sInstitucion {
+   my $entry = shift;
+   my %atributos = (
+                    "o"                             => "Organización",
+                    "associatedDomain"              => "Dominio",
+                    "telephoneNumber"               => "Telefono",
+                    "facsimileTelephoneNumber"      => "FAX",
+                    "postalAddress"                 => "Dirección",
+                    "postalCode"                    => "Código Postal",
+                    "l"                             => "Ciudad",
+                    "st"                            => "Provincia",
+                    "labeledURI"		    => "URL",
+                    );
+   my $string = "% Information related to ";
+   $string .= $entry->dn() . "\n\n";
+   foreach my $attr (keys %atributos) {
+      if ($entry->exists($attr)) {
+         $string .= $atributos{$attr}.":\t\t";
+         $string .= join " - ",@{$entry->get_value($attr, asref => 1)};
+         $string .= "\n";
+      }
+   }
+   $string .= "\n";
+   return $string;
+}  
+   
+###########################################################################################
+# Get an entry which is process at a string.
+sub e2sIPRange {
+   my $entry = shift;
+   my %atributos = (
+                    #"irisWhoisCIDR"      => "Rango IP",
+                    "irisWhoisNetName"   => "Nombre de la red",
+                    "irisWhoisASN"       => "ASN",
+                "irisWhoisRouter"    => "Router"
+                    );
+   my $string = "% Information related to ";
+   $string .= $entry->dn() . "\n\n";
+   foreach my $attr (keys %atributos) {
+      if ($entry->exists($attr)) {
+         $string .= $atributos{$attr}.":\t";
+         $string .= join " - ",@{$entry->get_value($attr, asref => 1)};
+         $string .= "\n";
+      }
+   }$dataConfig[1]->[5];
+   $string .= "\n";
+   return $string;
+}     
+
+
+###########################################################################################
+#
+# SQL Functions
+#
+###########################################################################################
+
+
+###########################################################################################
+# Connect to a database according config data stored in $conffile 
+
+sub MySQLConnect {
+	my $connection = shift;
+
+	my @dataConfig = @{$SobreIRIS::MySQLInfo};
+
+	my $host = $dataConfig[1]->[1];
+	my $dataBase = $dataConfig[1]->[3];
+	my $tableName = $dataConfig[1]->[5];
+	my $user = $dataConfig[1]->[7];
+	my $password = $dataConfig[1]->[9];
+
+	#Modo debug para saber que se estan metiendo bien los campos
+	if (open LOGFILE,">>$SobreIRIS::LogFile") {
+        	print LOGFILE "\t>> ".$dataConfig[1]->[0]." ".$host."\n";
+		print LOGFILE "\t>> ".$dataConfig[1]->[2]." ".$dataBase."\n";
+		print LOGFILE "\t>> ".$dataConfig[1]->[4]." ".$tableName."\n";
+		print LOGFILE "\t>> ".$dataConfig[1]->[6]." ".$user."\n";
+		print LOGFILE "\t>> ".$dataConfig[1]->[8]." ".$password."\n";
+                close LOGFILE;
+	}
+	
+	#$connection = DBI->connect($host, $database, $user, $password);
+		
+	return 0;
+
+}
+
+
+###########################################################################################
+# Close a MySQL connection given a connection ID
+si
+sub MySQLClose {
+	my $connection = shift;
+	
+	$connection->disconnect;
+
+	return 0;
+}
+
+
+###########################################################################################
+# Make a MySQL query given a RedIRIS institution acronym
+# 
+
+sub MySQLQuery {
+	my $connection = shift;
+	my $acronym = shift;
+
+	my @dataConfig = @{$SobreIRIS::MySQLInfo};
+	my $tableName = $dataConfig[1]->[5]; 
+
+	my $SQLquery = "Select * from ".$tableName;
+
+	return 0;
+}
+
+1;

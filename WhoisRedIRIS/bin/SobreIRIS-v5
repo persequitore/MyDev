@@ -1,0 +1,969 @@
+#! /usr/bin/perl
+
+# INFORMACIÓN DEL PROGRAMA
+# ---------------------------
+# 
+# 	WHOIS optimizado para RedIRIS
+# 
+# 	Nombre:			SobreIRIS-v5 (desarrollado en lenguaje PERL)
+# 	Version: 		5.0
+#	Fecha creación:		21 de octubre de 2011
+#	Fecha de modificación: 	11 de noviembre de 2011
+# 
+# 
+# RESUMEN
+# --------
+# 
+#	El programa whois se debe ejecutar en un servidor de la siguiente manera: -> perl SobreIRIS
+#	En la máquina cliente, la invocación debe ser: whois -h [máquina_servidor] [ip_v4|ip_v6|dominio|host]
+#
+#	La ejecución de este programa está dividida en X pasos claramente diferenciados:
+#	
+#	i)   Lectura de la entrada desde el cliente por la línea whois
+#	ii)  Acceso a MySQL para obtener, entre otros parámetros el acrónimo de la institución y copacode (además del router, asn, nombre, ...)
+#	iii) Con el copacode y el acrónimo realizamos tres búsquedas en LDAP (datos institucionales, contactos oficiales y contactos CERT). Los resultados se almacenan en un hash.
+#	iv)  Volcamos los resultados obtenidos en MySQL y LDAP a un string. De esta forma podemos maquetar la visualización de los resultados de una forma bonita
+#
+# 
+# CONSTANTS AND VARIABLES THAT CAN BE MODIFIED
+# ----------------------------------------------
+# 
+# 	IMPORTANTE: En este código NO se debe modificar ningún parámetro.
+#
+# 	Para ello hay un archivo creado en exclusividad para la configuración del programa.
+#	Éste se encuentra en la ruta /etc/sobreiris/RedIRISWhois_conf.pm
+# 
+#
+# DEPENDENCIAS
+# -------------
+# 
+#	No se requieren dependencias exceptuando las librerías PERL:
+#
+#	Data::Dumper;
+#	POE qw(Component::Server::TCP Filter::Reference Component::Client::Whois::Smart);
+#	Data::Validate::IP;
+#	Data::Validate::Domain;
+#	Net::DNS;
+#	NetAddr::IP;
+#	Net::IP;
+#	Math::BigInt;
+#	CGI::Carp qw(fatalsToBrowser);
+#	DBI;
+#	Net::LDAP;
+#	Net::Whois::Proxy;
+#
+# 
+# COPYRIGHT
+# -----------
+#  
+# 	This software is Copyright (c):
+# 		- Carlos Fuente Bermejo - carlos.fuentes@rediris.es
+# 		- David Rodriguez Galiano - david.rodriguez@soporte.rediris.es 
+# 
+
+package RedIRISWhois;
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+
+use POE qw(Component::Server::TCP Filter::Reference Component::Client::Whois::Smart);
+
+# IP Libraries
+use Data::Validate::IP;
+use Data::Validate::Domain;
+use Net::DNS;
+
+use NetAddr::IP;
+use Net::IP;
+use Math::BigInt;
+use Math::BigInt::Calc;
+
+# SQL libraries
+use CGI::Carp qw(fatalsToBrowser);
+use DBI;
+
+# LDAP libraries
+use Net::LDAP;
+
+# Whois libraries
+use Net::Whois::Proxy;
+
+# Modo debug --> + verbose
+# NO TOCAR ESTA CONFIGURACIÓN. LOS VALORES SE ASIGNAN EN /etc/sobreiris/RedIRISWhois_conf.pm
+my $_DEBUG_ = 0;
+my $_VERBOSE_ = 0;
+
+# Version
+my $_VERSION_ = 5.0;
+
+# Parametros de configuracion
+my $confFile="/etc/sobreiris/SobreIRIS_Conf.pm";
+
+# Puerto de escucha
+my $port = 43;
+
+# Identificador de la conexión MySQL
+my $MySQLid = 0;
+
+# Lectura de la configuracion
+loadConfig($confFile);
+
+
+########################################### PROGRAMA PRINCIPAL  ##########################################
+if ($RedIRISWhois::_DEBUG_) {
+        $_DEBUG_ = $RedIRISWhois::_DEBUG_;
+        writeLog("Modo DEBUG ACTIVADO.") if $_DEBUG_;
+}
+
+if ($RedIRISWhois::_VERBOSE_) {
+        $_VERBOSE_ = $RedIRISWhois::_VERBOSE_;
+        writeLog("Modo VERBOSE ACTIVADO.") if ($_DEBUG_ and $_VERBOSE_);
+}
+
+
+if ($RedIRISWhois::ListenOnPort) {
+        $port = $RedIRISWhois::ListenOnPort;
+        writeLog("Puerto de conexión $port leído de fichero de configuración.") if $_DEBUG_;
+} else {
+        $port = 43;
+	writeLog("Puerto de conexión $port. Falló la lectura del fichero de configuración $confFile.") if ($_DEBUG_ and $_VERBOSE_);
+}
+
+
+# Abriendo socket
+POE::Component::Server::TCP->new(
+        Alias => "RedIRISWhois",
+        Port         => $port,
+        ClientConnected => \&clientConnected,
+        ClientInput  => \&got_request,
+        ClientDisconnected => \&clientDisconnected,
+);
+
+$poe_kernel->run();
+
+exit (0);
+
+
+
+###########################################  FUNCIONES  #################################################
+
+###########################################################################################
+# Escribe un mensaje en el fichero de logs
+sub writeLog {
+	my $message = shift;
+	if (open LOGFILE,">>$RedIRISWhois::LogFile") {
+                print LOGFILE scalar localtime(time)." $message\n";
+                close LOGFILE;
+        }
+}
+
+###########################################################################################
+# Lee y carga el fichero de configuracion
+sub loadConfig {
+   my $file = shift;
+   local *Set = sub { $_[0] = $_[1] unless defined $_[0] };
+   require $file || die writeLog("No se ha podido cargar el fichero de configuración '$file'\n$@.");
+}
+
+
+###########################################################################################
+# Notificacion apertura de conexión de cliente
+sub clientConnected {
+	writeLog("Conexión establecida desde $_[HEAP]{remote_ip}.");
+        $_[HEAP]{client}->put("");
+	$_[HEAP]{client}->put("Whois de RedIRIS v.$_VERSION_ // Conectado desde $_[HEAP]{remote_ip}");
+        $_[HEAP]{client}->put("---------------------------------------------------------");
+	$_[HEAP]{client}->put("\n");
+}
+
+
+###########################################################################################
+# Notificacion de cierre de conexión de cliente
+sub clientDisconnected {
+        writeLog("El cliente con IP $_[HEAP]{remote_ip} se ha desconectado.");
+} 
+
+
+###########################################################################################
+# Chequea si la cadena introducida es una dirección IP
+sub isIP {
+        my ($query) = @_;
+        if (isIPv4($query) || isIPv6($query) ) {
+                return 1;
+        }
+        return 0;
+}
+
+
+###########################################################################################
+# Chequea si la cadena introducida es una IPv4
+sub isIPv4 {
+        my ($query) = @_;
+        my $ip = Data::Validate::IP->new();
+        if ( $ip->is_ipv4($query) ) {
+                return 1;
+        }
+        return 0;
+}
+
+
+###########################################################################################
+# Chequea si la cadena introducida es una IPv6
+sub isIPv6 {
+        my ($query) = @_;
+        my $ip = Data::Validate::IP->new();
+        if ( $ip->is_ipv6($query)) {
+                return 1;
+        }
+        return 0;
+}
+
+
+###########################################################################################
+# Chequea si la cadena introducida es un hostname. Devuelve 1 en caso afirmativo y 0 en caso contrario
+=kk
+sub isHostname {
+        my $query = shift;
+
+	my $ip;
+
+        my $res = Net::DNS::Resolver->new;
+        my $result = $res->search($query);
+        if ($result) {
+                foreach my $rr ($result->answer) {
+                        if ($rr->type eq "A") {
+				$ip = $rr->address;
+                                return 1;
+                        }
+                }
+        }
+        return 0;
+}
+=cut
+
+###########################################################################################
+# Chequea si la cadena introducida es un hostname. 
+# En caso afirmativo la función devuelve un 1 de forma directa y a través del argumento IP devuelve la IP asociada al hotname indicado
+# En caso contrario devuelve un 0
+sub isHostname {
+        my $query = shift;
+        my $ip = shift;
+
+        my $res = Net::DNS::Resolver->new;
+        my $result = $res->search($query);
+        if ($result) {
+                foreach my $rr ($result->answer) {
+                        if ($rr->type eq "A") {
+                                $$ip = $rr->address;
+                                return 1;
+                        }
+                }
+        }
+        return 0;
+}
+
+
+
+###########################################################################################
+# Chequea si la cadena introducida es un dominio
+sub isDomain {
+   my ($querystring) = @_;
+
+   my $v = Data::Validate::Domain->new();
+   if ($v->is_domain($querystring)) {
+      my $res = Net::DNS::Resolver->new;
+      my $query = $res->query($querystring, "SOA");
+      if ($query) {
+         return 1;
+      }
+   }
+   return 0;
+}
+
+
+###########################################################################################
+# Gestiona la consulta
+sub got_request {
+	my ($kernel, $heap, $session, $input) = @_[KERNEL, HEAP, SESSION, ARG0];
+	my $ip = 0;
+
+	# Almacena todos los datos de rangos, router, ... (información almacenada en MySQL) de una petición de whois
+	my %MySQLResults = ();
+
+	# Almacena los parametros de configuración y búsqueda de LDAP escritos en el fichero de configuración
+	my %LDAPConfigParams = ();
+
+	# Almacena las entradas de LDAP devueltas en cada búsqueda. (Es una variable auxiliar que se reutiliza en cada búsqueda)
+	my $LDAPResults;
+
+	# Almacena todos los resultados de las sucesivas búsquedas que se lanzan contra LDAP
+	my %allHashResults = ();
+
+	# Variable en la que devolvemos los resultados de las búsquedas de MySQL y LDAP (extraídos de %allHashResults) para una impresión bonita
+	my $allStringResults;
+
+	# Identificador de las conexiones LDAP
+	my $LDAPid = 0;
+	
+	# Variable que almacena los valores de error de retorno de las funciones
+	my $errCode = 0;
+
+	if ($input ne "" && defined $input) {
+
+		# Si no es un hostname ni un dominio ni una IP, devolvemos un error puesto que la cadena no es reconocida
+                if (!isHostname($input, \$ip) and !isIP($input) and !isDomain($input)){
+                        $allStringResults = "La cadena '".$input."' no es una dirección IP, ni hostname, ni un dominio.";
+                        writeLog($allStringResults);
+                        $_[HEAP]{client}->put("\t".$allStringResults."\n\n");
+                        forceShutdown($kernel);
+                        return;
+                }
+
+
+		# Si es un hostname, buscamos su dirección IP para realizar el whois
+		# Un hostname, una IPv4 y una IPv6 se tratan de la misma manera
+		if (isHostname($input, \$ip)){
+                	writeLog("El valor introducido '$input' es un hostname y su dirección IP '".$ip."' es IPv4.") if ($_DEBUG_ and $_VERBOSE_);	
+		}
+		else{
+			$ip = $input;
+		}
+
+
+		# Comprobamos que es una dirección IP
+		# El trato para una IPv4 o una IPv6 es el mismo. Solo difiere la consulta en MySQL, pero las consultas en LDAP son iguales
+		if (isIP($ip)){
+
+			#IPv4
+			if (isIPv4($ip)){
+				writeLog("El valor introducido '$ip' es una dirección IPv4.") if ($ip eq $input and $_DEBUG_ and $_VERBOSE_);
+			
+				# Conexión a base de datos para extraer el rango, acrónimo y copacode
+				MySQLConnect(\$MySQLid);
+				$errCode = MySQLQueryByIPv4($MySQLid, $ip, \%MySQLResults);
+				MySQLDisconnect($MySQLid);
+			}
+			#IPv6
+			elsif (isIPv6($ip)){
+                                writeLog("El valor introducido '$ip' es una dirección IPv6.") if ($ip eq $input and $_DEBUG_ and $_VERBOSE_);
+
+				# Desgranamos la IPv6 para realizar búsquedas en la base de datos
+				# IP (128b) = parteAlta (64b) | parteBaja (64b) 
+
+				my $CALC = 'Math::BigInt::Calc';
+
+				my $objetoIP = new Net::IP($ip,6);
+  				my $binaryIP = ($objetoIP->binip()); 				# Ipv6 en binario (128 bits)
+  				
+				my $altaBin = substr ($binaryIP, 0, 64);			# primeros 64 bits
+ 				my $altaInt = $CALC->_str($CALC->_from_bin("0b".$altaBin));	# pasar a BigINT para realizar la búsqueda en MySQL
+				
+				my $bajaBin = substr ($binaryIP, 64,64);			# últimos 64 bits
+ 				my $bajaInt = $CALC->_str($CALC->_from_bin("0b".$bajaBin));	
+   
+				# Conexión a base de datos para extraer el rango, acrónimo y copacode
+                                MySQLConnect(\$MySQLid);
+                                $errCode = MySQLQueryByIPv6($MySQLid, \$altaInt, \$bajaInt, \%MySQLResults);
+                                MySQLDisconnect($MySQLid);
+				
+			}
+		}
+                
+		# Comprobamos que el input es el nombre de un dominio
+		# Compruebamos también que no sea también un hostname. Esto se debe a que, por ejemplo, dominio.es y www.dominio.es a veces resuelven a la misma IP y otras no
+		# Por ello, si un input resuelve como hostname, no lo resolvemos como dominio para evitar errores
+                if (!isHostname($input, \$ip) and isDomain($input)){
+                        writeLog("El valor introducido '$input' es un dominio.") if ($_DEBUG_ and $_VERBOSE_);
+
+			MySQLConnect(\$MySQLid);
+                        $errCode = MySQLQueryByDomain($MySQLid, $input, \%MySQLResults);
+                        MySQLDisconnect($MySQLid);
+                }
+
+	
+	        # Independientemente que sea un hostname, un dominio o una IP siempre devolvemos un hash (%MySQLResults) con los resultados de la consulta
+        	# Al menos, en estas consultas, debe aparecer el acrónimo y copacode, además del nombre de la institución y otros datos de interés no obligatorios
+
+		# Si las consultas en la base de datos devuelve -1 significa que no hay ningún resultado relacionado con instituciones de RedIRIS
+		# Por ello devolvemos el resultado del whois que devuelva el RIR más adecuado
+		if ($errCode == -1){
+			forceShutdown($kernel);
+			$allStringResults = "No se han encontrado resultados en las bases de datos -MySQL- de RedIRIS.";
+			writeLog($allStringResults) if $_DEBUG_;
+                        $_[HEAP]{client}->put("\t".$allStringResults);
+			$allStringResults = "El valor devuelto petenece a Regional Internet Registry (RIR) más adecuado.";
+              		writeLog($allStringResults) if $_DEBUG_;
+			$_[HEAP]{client}->put("\t".$allStringResults."\n\n");
+				
+			my $whois = new Net::Whois::Proxy;
+             		my $record = $whois->whois($ip);
+       			$_[HEAP]{client}->put($record);	
+			return;
+		}
+		
+		# Independientemente que sea un hostname, un dominio o una IP siempre devolvemos un hash (%MySQLResults) con los resultados de la consulta
+		# Al menos, en estas consultas, debe aparecer el acrónimo y copacode, además del nombre de la institución y otros datos de interés no obligatorios
+
+		# Leemos la configuración de LDAP para realizar consultas
+		LDAPParams(\%LDAPConfigParams);		
+
+		# Con el acrónimo y el copacode extraídos de MySQL y con la configuración de LDAP accedemos a LDAP para
+		# extraer el resto de información de las instituciones (dirección, contactos, ...)
+		
+		# Conexión a LDAP para extraer los datos de la institución con el acrónimo y copacode extraídos de MySQL
+		LDAPConnect($LDAPConfigParams{'institution'}->{'Host'}, $LDAPConfigParams{'institution'}->{'Port'}, $LDAPConfigParams{'institution'}->{'TimeOut'}, $LDAPConfigParams{'institution'}->{'BindDN'}, $LDAPConfigParams{'institution'}->{'BindPassword'}, \$LDAPid);
+
+		$LDAPResults = LDAPQuery($LDAPid, $LDAPConfigParams{'institution'}->{'BaseDN'}, $LDAPConfigParams{'institution'}->{'Filter'}, $MySQLResults{'copacode'});
+		$allHashResults{'institution'} = $LDAPResults;
+
+		LDAPDisconnect($LDAPid);
+		
+		if ($LDAPResults == -1){
+			forceShutdown($kernel);
+                	$allStringResults = "[EXCEPCIÓN GRAVE] Búsqueda fallida en LDAP / Búsqueda por institución.\n";
+                        writeLog($allStringResults);
+                        $_[HEAP]{client}->put("\t".$allStringResults."\n\n");
+                        return;
+		}
+
+                # Conexión a LDAP para extraer los datos de los contactos oficiales con el acrónimo extraídos de MySQL
+                LDAPConnect($LDAPConfigParams{'irisPerson'}->{'Host'}, $LDAPConfigParams{'irisPerson'}->{'Port'}, $LDAPConfigParams{'irisPerson'}->{'TimeOut'}, $LDAPConfigParams{'irisPerson'}->{'BindDN'}, $LDAPConfigParams{'irisPerson'}->{'BindPassword'}, \$LDAPid);
+
+                $LDAPResults = LDAPQuery($LDAPid, $LDAPConfigParams{'irisPerson'}->{'BaseDN'}, $LDAPConfigParams{'irisPerson'}->{'Filter'}, $MySQLResults{'copacode'});
+                $allHashResults{'irisPerson'} = $LDAPResults;
+
+                LDAPDisconnect($LDAPid);
+
+                if ($LDAPResults == -1){
+ 	               forceShutdown($kernel);
+                       $allStringResults = "[EXCEPCIÓN GRAVE] Búsqueda fallida en LDAP / Búsqueda por contactos oficiales.\n";
+                       writeLog($allStringResults); 
+	               $_[HEAP]{client}->put("\t".$allStringResults."\n\n");
+                       return;
+               	}       
+
+		# Conexión a LDAP para extraer los datos de los contactos CERT con el acrónimo extraídos de MySQL
+		LDAPConnect($LDAPConfigParams{'certPerson'}->{'Host'}, $LDAPConfigParams{'certPerson'}->{'Port'}, $LDAPConfigParams{'certPerson'}->{'TimeOut'}, $LDAPConfigParams{'certPerson'}->{'BindDN'}, $LDAPConfigParams{'certPerson'}->{'BindPassword'}, \$LDAPid);
+
+        	$LDAPResults = LDAPQuery($LDAPid, $LDAPConfigParams{'certPerson'}->{'BaseDN'}, $LDAPConfigParams{'certPerson'}->{'Filter'}, $MySQLResults{'acronimo'});
+                $allHashResults{'certPerson'} = $LDAPResults;
+
+                LDAPDisconnect($LDAPid);
+                        
+                if ($LDAPResults == -1){
+                	forceShutdown($kernel);
+                        $allStringResults = "[EXCEPCIÓN GRAVE] Búsqueda fallida en LDAP / Búsqueda por contactos de seguridad.\n";
+                        writeLog($allStringResults);
+			$_[HEAP]{client}->put("\t".$allStringResults."\n\n");
+                        return;
+               	}       
+	
+		# Imprime los resultados de forma bonita que se han almaecendo en el string
+		$allStringResults = prettyPrint(\%MySQLResults, \%allHashResults);
+		$_[HEAP]{client}->put($allStringResults);
+
+
+	# Si no es una dirección IP, ni un hostname, ni un dominio, entonces la cadena no es valida
+	}
+	elsif (length($input) == 0){
+		writeLog("La cadena introducida tiene longitud 0. No se realiza ninguna búsqueda en el whois.") if $_DEBUG_;
+	}
+        else {
+                $_[HEAP]{client}->put("La cadena no está definida o se desconoce qué tipo es.");
+                writeLog("La cadena introducida no está definida o se desconoce qué tipo es.") if $_DEBUG_;
+        }
+
+	# Independientemente de si la búsqueda es satisfactoria, o no, desconectamos al cliente
+	$kernel->yield("shutdown");
+	return;
+}
+
+
+
+###########################################################################################
+# Conexión a una base de datos de acuerdo a los parámetros del fichero de configuración 
+sub MySQLConnect {
+        my $connection = shift;
+
+        my @dataConfig = @{$RedIRISWhois::MySQLInfo};
+	my %MySQLparams = ();
+
+	# Bucle para meter en un hash los parametros de configuracion que se encuentran en el array cargado por la funcion Load
+	for (my $i=0; $i < scalar(@{$dataConfig[1]}); $i=$i+2){
+		$MySQLparams{$dataConfig[1]->[$i]} = $dataConfig[1]->[$i+1];
+	}
+
+        writeLog("Parametros de configuración leídos de configuración para MySQL:") if ($_DEBUG_ and $_VERBOSE_);
+	writeLog(Dumper(\%MySQLparams)) if $_DEBUG_;
+	
+	my $source = "DBI:mysql:".$MySQLparams{Database}.";host=".$MySQLparams{Host}.";port=".$MySQLparams{Port};
+        $$connection = DBI->connect($source, $MySQLparams{User}, $MySQLparams{Password}) or die writeLog("Fallo al conectar a ".$source.": ".$$connection->errstr."."); 
+	writeLog("Conexión a base de datos realizada satisfactoriamente con id ".$$connection.".") if $_DEBUG_;
+
+        return 0;
+
+}
+
+
+###########################################################################################
+# Cierra una conexión MySQL dado su identificador
+sub MySQLDisconnect {
+        my $connection = shift;
+        $connection->disconnect;
+	writeLog("Cierre de conexión a base de datos realizada satisfactoriamente.") if $_DEBUG_;
+}
+
+
+###########################################################################################
+# Realiza una query dada una dirección IP para obtener el rango
+sub MySQLQueryByIPv4 {
+        my $connection = shift;
+        my $inputIP = shift;
+	my $hashResult = shift;
+
+        my @dataConfig = @{$RedIRISWhois::MySQLInfo};
+	my %MySQLparams = ();
+
+        # Bucle para meter en un hash los parametros de configuracion que se encuentran en el array cargado por la funcion Load
+        for (my $i=0; $i < scalar(@{$dataConfig[1]}); $i=$i+2){
+                $MySQLparams{$dataConfig[1]->[$i]} = $dataConfig[1]->[$i+1];
+        }
+
+	# Compruebo si es una IPv4
+	if (isIPv4($inputIP)){
+	
+		my $ip = new NetAddr::IP $inputIP;
+		my $integerIP = $ip->numeric();
+
+		writeLog ("La IP $ip se ha convertido en el entero $integerIP.") if ($_DEBUG_ and $_VERBOSE_);
+
+		# Calculamos el numero de tuplas que vamos a encontrar con la búsqueda	
+		my $query = "SELECT `rangosred`.`id` AS id, `rangosred`.`CIDR` AS cidr, `acr2copa`.`ACRONIMO` AS acronimo, `acr2copa`.`DESCRIPCION` AS descripcion, `rangosred`.`ROUTER` AS router, `rangosred`.`ASN` AS asn, `acr2copa`.`COPACODE` AS copacode, `rangosred`.`LASTIP` - `rangosred`.`FIRSTIP` AS diferencia FROM `NOCData`.`rangosred`, `NOCData`.`acr2copa` 
+WHERE `rangosred`.`PTR_ACR2COPA` = `acr2copa`.`id` AND `rangosred`.`FIRSTIP` <= '".$integerIP."' AND `rangosred`.`LASTIP` >= '".$integerIP."' AND `rangosred`.`tipo` = '4' ORDER BY diferencia ASC;";
+	
+		my $queryResults = $connection->prepare($query);
+
+        	$queryResults->execute or die writeLog("Imposible ejecutar consulta:$connection->err, $connection->errstr.");
+
+		# Si no hay resultados, salimos de la función
+		if ($queryResults->rows == 0) {
+			writeLog("No se han obtenido resultados en la búsqueda.") if $_DEBUG_;
+                        return -1;
+                } else {
+
+                        ($hashResult->{'id'}, $hashResult->{'cidr'}, $hashResult->{'acronimo'}, $hashResult->{'descripcion'}, $hashResult->{'router'}, $hashResult->{'asn'}, $hashResult->{'copacode'}, my $dif) = $queryResults->fetchrow_array;
+		}	
+	}
+	
+        return 0;
+}
+
+
+###########################################################################################
+# Realiza una query dada una dirección IP para obtener el rango
+sub MySQLQueryByIPv6 {
+        my $connection = shift;
+        my $IPParteAlta = shift;
+	my $IPParteBaja = shift;
+        my $hashResult = shift;
+
+        my @dataConfig = @{$RedIRISWhois::MySQLInfo};
+        my %MySQLparams = ();
+
+        # Bucle para meter en un hash los parametros de configuracion que se encuentran en el array cargado por la funcion Load
+        for (my $i=0; $i < scalar(@{$dataConfig[1]}); $i=$i+2){
+                $MySQLparams{$dataConfig[1]->[$i]} = $dataConfig[1]->[$i+1];
+        }
+
+        # Calculamos el numero de tuplas que vamos a encontrar con la búsqueda  
+	my $query = "SELECT `rangosred`.`id` AS id, `rangosred`.`CIDR` AS cidr, `acr2copa`.`ACRONIMO` AS acronimo, `acr2copa`.`DESCRIPCION` AS descripcion, `rangosred`.`ROUTER` AS router, `rangosred`.`ASN` AS asn, `acr2copa`.`COPACODE` AS copacode FROM `NOCData`.`rangosred`, `NOCData`.`acr2copa` WHERE `rangosred`.`PTR_ACR2COPA` = `acr2copa`.`id` AND `rangosred`.`FIRSTIPTOP` <= '".$$IPParteAlta."'  AND `rangosred`.`LASTIPTOP` >= '".$$IPParteAlta."' AND `rangosred`.`FIRSTIP` <= '".$$IPParteBaja."' AND `rangosred`.`LASTIP` >= '".$$IPParteBaja."' AND `rangosred`.`tipo` = '6';";
+
+        my $queryResults = $connection->prepare($query);
+
+        $queryResults->execute or die writeLog("Imposible ejecutar consulta:$connection->err, $connection->errstr.");
+
+        # Si no hay resultados, salimos de la función
+        if ($queryResults->rows == 0) {
+        	writeLog("No se han obtenido resultados en la búsqueda.") if $_DEBUG_;
+                return -1;
+      	} else {
+
+      	       ($hashResult->{'id'}, $hashResult->{'cidr'}, $hashResult->{'acronimo'}, $hashResult->{'descripcion'}, $hashResult->{'router'}, $hashResult->{'asn'}, $hashResult->{'copacode'
+}, my $dif) = $queryResults->fetchrow_array;
+        }
+
+        return 0;
+}
+
+
+###########################################################################################
+# Realiza una query dada un dominio para obtener el acrnimo y copacode
+sub MySQLQueryByDomain {
+        my $connection = shift;
+        my $inputDomain = shift;
+        my $hashResult = shift;
+
+        my @dataConfig = @{$RedIRISWhois::MySQLInfo};
+        my %MySQLparams = ();
+
+        # Bucle para meter en un hash los parametros de configuracion que se encuentran en el array cargado por la funcion Load
+        for (my $i=0; $i < scalar(@{$dataConfig[1]}); $i=$i+2){
+                $MySQLparams{$dataConfig[1]->[$i]} = $dataConfig[1]->[$i+1];
+        }
+
+        # Compruebo si es una IPv4
+        if (isDomain($inputDomain)){
+
+                # Calculamos el numero de tuplas que vamos a encontrar con la búsqueda
+		my $query = "SELECT `rangosred`.`id` AS id, `rangosred`.`CIDR` AS cidr, `acr2copa`.`ACRONIMO` AS acronimo, `acr2copa`.`DESCRIPCION` AS descripcion, `rangosred`.`ROUTER` AS router, `rangosred`.`ASN` AS asn, `acr2copa`.`COPACODE` AS copacode FROM `NOCData`.`DNS_SecundariosDirectos`, `NOCData`.`acr2copa`, `NOCData`.`rangosred` WHERE `DNS_SecundariosDirectos`.`zona`='".$inputDomain."' AND `DNS_SecundariosDirectos`.`PTR_ACR2COPA` = `acr2copa`.`id` AND `acr2copa`.`id` = `rangosred`.`PTR_ACR2COPA`;";
+  
+                my $queryResults = $connection->prepare($query);
+
+                $queryResults->execute or die writeLog("Imposible ejecutar consulta:$connection->err, $connection->errstr.");
+
+		my $numTuplas = $queryResults->rows;
+
+                # Si no hay resultados, salimos de la función
+                if ($numTuplas == 0) {
+                        writeLog("No se han obtenido resultados en la búsqueda por dominio.") if $_DEBUG_;
+                        return -1;
+                } 
+		elsif ($numTuplas == 1){
+			# Si solo se ha obtenido un resultado, devolvemos los valores
+			 writeLog("Ha habido un único resultado en la búsqueda por dominio.") if ($_DEBUG_ and $_VERBOSE_);
+			($hashResult->{'id'}, $hashResult->{'cidr'}, $hashResult->{'acronimo'}, $hashResult->{'descripcion'}, $hashResult->{'router'}, $hashResult->{'asn'}, $hashResult->{'copacode'
+}, my $dif) = $queryResults->fetchrow_array;
+		}
+		else {
+			# Si devuelve mas de un resultado devolvemos todos los valores
+			writeLog("Ha habido más de un resultado en la búsqueda por dominio") if ($_DEBUG_ and $_VERBOSE_);
+			while ((my $id, my $cidr, my $acronimo, my $descripcion, my $router, my $asn, my $copacode) = $queryResults->fetchrow_array){
+				if ($id){
+					$hashResult->{'id'} = $id;
+				}
+				if ($cidr){
+					$hashResult->{'cidr'} .= $cidr." ";
+				}
+				if ($acronimo){
+					$hashResult->{'acronimo'} = $acronimo;
+				}
+				if ($descripcion){
+					$hashResult->{'descripcion'} = $descripcion;
+				}
+				if ($router){
+					$hashResult->{'router'} .= $router." ";
+				}
+				if ($asn){
+					$hashResult->{'asn'} = $asn;
+				}	
+				if ($copacode){
+					$hashResult->{'copacode'} = $copacode;
+				}
+			}
+                }
+        }
+
+        return 0;
+}
+
+
+###########################################################################################
+# Conexión a un LDAP de acuerdo a los parámetros de configuración pasados por argumento 
+sub LDAPConnect {
+	my $host = shift;
+	my $port = shift;
+	my $timeOut = shift;
+	my $dn = shift;
+	my $password = shift;
+        
+	my $connection = shift;
+
+	$$connection = Net::LDAP->new($host, port => $port, timeout => $timeOut, async => 1) or die writeLog("Fallo al conectarse a LDAP '".$host."'.");
+	
+	$$connection->bind($dn, password => $password);	
+
+        writeLog("Conexión a LDAP realizada satisfactoriamente con id ".$$connection.".") if $_DEBUG_;
+
+        return 0;
+
+}
+
+
+###########################################################################################
+# Cierra una conexión LDAP dado su identificador
+sub LDAPDisconnect {
+        my $connection = shift;
+        $connection->unbind;
+        writeLog("Cierre de conexión a LDAP realizada satisfactoriamente.") if $_DEBUG_;
+}
+
+
+###########################################################################################
+# Lee los parametros de Lee los parametros de configuración de LDAP y los almacena en un hash
+sub LDAPParams {
+
+	my $LDAPHashRefParams = shift;
+
+        my @dataConfig = @{$RedIRISWhois::LDAPInfo};
+
+	# Completamos una referencia a un hash en el que se incluyen todos los parámetros de configuración de LDAP
+	# En la linea que se encuentra comentada se puede visualizar la lógica de cómo se están leyendo los parámetros
+	# de configuración del fichero
+
+	for (my $i=0; $i < scalar(@dataConfig); $i=$i+2){
+		for (my $j=0; $j < scalar(@{$dataConfig[$i+1]}); $j=$j+2){
+			# writeLog($dataConfig[$i]." -> ".$dataConfig[$i+1]->[$j]." = ".$dataConfig[$i+1]->[$j+1]);
+			$LDAPHashRefParams->{$dataConfig[$i]}->{$dataConfig[$i+1]->[$j]} = $dataConfig[$i+1]->[$j+1] ;
+		}
+	}
+
+        if ($_DEBUG_){
+                writeLog("Parametros de configuración leídos de configuración para LDAP:") if ($_DEBUG_ and $_VERBOSE_);
+        	writeLog(Dumper($LDAPHashRefParams));
+	}
+}
+
+
+###########################################################################################
+# Ejecuta una consulta sobre LDAP dado el id de la conexión, la base, el filtro, y el valor que 
+# hay que sustituir en el filtro por la expresión regular
+sub LDAPQuery {
+	my $LDAPid = shift;
+	my $baseDN = shift;
+	my $filter = shift;
+
+	# Cadena a sustituir por la expresión regular del filtro	
+	my $stringToReplace = shift;
+
+	$filter =~ s/VALUE_DATA/$stringToReplace/;
+	
+	my $result = $LDAPid->search (
+		base => $baseDN, 
+		filter => $filter,
+		scope => 'sub',
+	);
+
+
+	if ($result->error eq "Success"){
+		if (scalar ($result->entries) > 0){
+			my @aux = $result->entries;
+			return \@aux;
+		}
+		else{
+			writeLog("No se han encontrado entradas para LDAP con los siguientes parametros:") if $_DEBUG_;
+			writeLog("\tBaseDN: '".$baseDN."' - Filtro: '".$filter."'.") if $_DEBUG_;
+			return 0;
+		}
+	}
+	else{
+		writeLog("Búsqueda inválida [".$result->code."]: ".$result->error.".") if $_DEBUG_;
+		return -1;
+	}
+
+	return -1;
+}
+
+
+###########################################################################################
+# Convierte los valores devueltos por MySQL en un string
+sub e2sMySQL {
+	my $entry = shift;
+	my $string = undef;
+
+	if ($entry->{'descripcion'}){
+		$string .= "Institución:\t".$entry->{'descripcion'}."\n";
+	}
+	else{
+		$string .= "Institución:\t-\n";
+	}
+
+	if ($entry->{'acronimo'}){
+		$string .= "Acrónimo:   \t".$entry->{'acronimo'}."\n";
+	}
+	else{
+                $string .= "Acrónimo:    \t-\n";
+	}
+
+	if ($entry->{'cidr'}){
+		$string .= "CIDR:       \t".$entry->{'cidr'}."\n";
+	}
+	else{
+		$string .= "CIDR:       \t-\n";
+	}
+
+	if ($entry->{'router'}){
+		$string .= "Router:     \t".$entry->{'router'}."\n";
+	}
+	else{
+		$string .= "Router:     \t-\n";
+	}
+	
+	if ($entry->{'asn'}){
+		$string .= "ASN:        \t".$entry->{'asn'}."\n";
+	}
+	else{
+		$string .= "ASN:        \t-\n";
+	}
+	$string .= "\n";
+	return $string;
+}
+
+###########################################################################################
+# Convierte una entrada de LDAP tipo INSTITUCION en un string
+sub e2sInstitucion {
+   my $entry = shift;
+   my $string;
+   my %atributos = (
+                    "o"                             => "Organización",
+                    "associatedDomain"              => "Dominio",
+                    "telephoneNumber"               => "Telefono",
+                    "facsimileTelephoneNumber"      => "FAX",
+                    "postalAddress"                 => "Dirección",
+                    "postalCode"                    => "Código Postal",
+                    "l"                             => "Ciudad",
+                    "st"                            => "Provincia",
+                    "labeledURI"                    => "URL",
+                    );
+
+   foreach my $attr (keys %atributos) {
+      if ($entry->exists($attr)) {
+         $string .= $atributos{$attr}.":\t";
+         $string .= join " - ",@{$entry->get_value($attr, asref => 1)};
+         $string .= "\n";
+      }
+   }
+   $string .= "\n";
+   return $string;
+}
+
+
+###########################################################################################
+# Convierte una entrada de LDAP tipo INSTITUCION en un string
+sub e2sPerson {
+        my $entry = shift;
+        my %atributos = (
+                    "cn"                            => "Nombre y apellidos",
+                    "description"                   => "Cargo/ocupación",
+                    "businessCategory"              => "Tipo de contacto",
+                    "title"                         => "Título",
+                    "mail"                          => "E-mail",
+                    "telephoneNumber"               => "Telefono",
+                    "facsimileTelephoneNumber"      => "FAX",
+                    "schacUserStatus"               => "Rol",
+                    );
+	my %roles = (   'pec' => 'RT-CERT',
+                        'resmanager' => 'Responsable de investigación',
+                        'techcontact' => 'Contacto técnico',
+                        'pen' => 'Contacto NOC',
+                        'per' => 'Punto de enlance con RedIRIS',
+                        'sign' => 'Firmante de la institución',
+                );
+        my $string .= "- 8>< ----\n\n";
+	foreach my $attr (keys %atributos) {
+                if ($entry->exists($attr)) {
+                        if ($attr eq "schacUserStatus") {
+                                my $values = $entry->get_value($attr, asref => 1);
+                               	foreach my $value (@{$values}) {
+                                        if ($value =~ /:affiliation:role:/) {
+                                                $value =~ /urn:mace:terena.org:schac:userStatus:es:rediris.es:affiliation:role:(.*)/;
+                                                my $role = $1;
+                                                if (exists $roles{$role} ) {
+                                                        $role = $roles{$role};
+                                                }
+                                                $string .= $atributos{$attr}.":\t";
+                                                if ($role) {
+                                                        $string .= $role."\n";
+                                                }
+                                        }
+                                }
+
+                        } else {
+                                $string .= $atributos{$attr}.":\t";
+                                $string .= join " - ",@{$entry->get_value($attr, asref => 1)};
+                                $string .= "\n";
+                        }
+        }
+        }
+        $string .= "\n";
+        return $string;
+}
+
+
+###########################################################################################
+# Escribe en un string toda la información. La escribe con formato legible para mostrar en pantalla
+sub prettyPrint{
+	my $MySQLResults = shift;
+	my $LDAPResults = shift;
+
+	my $prettyString = "";
+
+	# Pasamos a string los valores MySQL
+	$prettyString  = "% Institucion, acronimo y rangos asignados:\n";
+	$prettyString .= "---------------------------------------------------------\n\n";
+
+	$prettyString .= e2sMySQL($MySQLResults);	
+	
+	$prettyString .="\n\n";
+
+
+	# Pasamos a string los valores de la institución
+	$prettyString .= "% Ubicacion y contacto generico de la institucion:\n";
+	$prettyString .= "---------------------------------------------------------\n\n";
+	
+	if ($LDAPResults->{'institution'} != 0 ) {
+		foreach my $entry (@{$LDAPResults->{'institution'}}) {
+			$prettyString .= e2sInstitucion($entry);
+        	}
+	}
+	else{
+                $prettyString .= "\tNo figura informacion generica de la institucion.\n\n";
+	}
+
+        $prettyString .="\n\n";
+
+
+        # Pasamos a string los valores de los contactos oficiales
+        $prettyString .= "% Contactos oficiales de la institucion:\n";
+        $prettyString .= "---------------------------------------------------------\n\n";
+	
+	if ($LDAPResults->{'irisPerson'} != 0 ) { 
+	        foreach my $entry (@{$LDAPResults->{'irisPerson'}}) {
+        	        $prettyString .= e2sPerson($entry);
+        	}
+	}
+	else{
+                $prettyString .= "\tNo figuran contactos oficiales. Accede a ComunIRIS para contactar con el/los PER/s.\n\n";
+	}
+
+        $prettyString .="\n\n";
+
+        # Pasamos a string los valores de los contactos CERT
+        $prettyString .= "% Contactos de seguridad operativos:\n";
+        $prettyString .= "---------------------------------------------------------\n\n";
+
+	if ($LDAPResults->{'certPerson'} != 0 ) {
+        	foreach my $entry (@{$LDAPResults->{'certPerson'}}) {
+               		$prettyString .= e2sPerson($entry);
+        	}
+	}
+	else{
+		$prettyString .= "\tNo figuran contactos de seguridad. Accede a ComunIRIS para contactar con el/los PCS/s.\n\n";
+	}
+
+	return $prettyString;
+
+}
+
+
+###########################################################################################
+# Fuerza la salida de un cliente
+sub forceShutdown{
+	my $kernel = shift;
+	
+	$kernel->yield("shutdown");
+        return;
+}
+
+1;
